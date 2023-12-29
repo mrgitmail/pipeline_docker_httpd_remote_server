@@ -1,0 +1,117 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_HUB_REPO = 'mrfwdmail/jenkins_docker'
+        //you better use withCredentials in Jenkins, not plain username/password
+        DOCKER_HUB_USERNAME = 'username'
+        DOCKER_HUB_PASSWORD = 'pass'
+        GITHUB_REPO_SSH_URL = 'git@github.com:mrgitmail/jenkins.git'
+        GITHUB_CREDENTIALS_ID = 'credentials_id_from_jenkins'
+        GITHUB_BRANCH = 'main'
+        REMOTE_SERVER_ADDRESS = 'ip'
+        REMOTE_SERVER_USERNAME = 'ssh username'
+
+
+        DOCKER_INSTALL_SCRIPT = '''
+            if ! command -v docker &> /dev/null; then
+                sudo yum install -y docker
+                sudo service docker start
+            fi
+        '''
+    }
+
+    stages {
+        stage('Clone from GitHub') {
+            steps {
+                // Clone your private project repository from GitHub using SSH. Need Guthub plugin installed in Jenkins.
+                checkout([$class: 'GitSCM', branches: [[name: GITHUB_BRANCH]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CloneOption', depth: 1]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: GITHUB_CREDENTIALS_ID, url: GITHUB_REPO_SSH_URL]]])
+            }
+        }
+
+        stage('Build and Push Docker Image') {
+            steps {
+                script {
+                    // Log in to Docker Hub
+                    sh "docker login -u $DOCKER_HUB_USERNAME -p $DOCKER_HUB_PASSWORD"
+
+                    // Pull the official httpd Docker image
+                    sh "docker pull httpd"
+
+                    // Create a Dockerfile to add custom content
+                    writeFile file: 'Dockerfile', text: '''
+                        FROM httpd
+                        COPY ./index.html /usr/local/apache2/htdocs/
+                    '''
+
+                    // Build a new Docker image
+                    sh "docker build -t $DOCKER_HUB_REPO:$BUILD_NUMBER ."
+
+                    // Tag the image for Docker Hub
+                    sh "docker tag $DOCKER_HUB_REPO:$BUILD_NUMBER $DOCKER_HUB_REPO:latest"
+
+                    // Push the new Docker image to Docker Hub
+                    sh "docker push $DOCKER_HUB_REPO:$BUILD_NUMBER"
+                    sh "docker push $DOCKER_HUB_REPO:latest"
+
+                    // Log out from Docker Hub
+                    sh "docker logout"
+                }
+            }
+        }
+
+
+        stage('Install Docker on Remote Server') {
+            steps {
+                script {
+                    // Use SSH credentials for authentication. Need ssh agent installed in Jenkins
+                    sshagent(credentials: ['main_ssh']) {
+                        // Execute Docker installation script on the remote server
+                        sh "ssh-keyscan $REMOTE_SERVER_ADDRESS >> ~/.ssh/known_hosts"
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS '${DOCKER_INSTALL_SCRIPT}'"
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'sudo usermod -aG docker $REMOTE_SERVER_USERNAME'"
+                        
+                    }
+                }
+            }
+        }
+        
+        
+        stage('Run Docker Container on Remote Server') {
+            steps {
+                script {
+                    // Use SSH credentials for authentication
+                    sshagent(credentials: ['main_ssh']) {
+
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'docker login -u $DOCKER_HUB_USERNAME -p $DOCKER_HUB_PASSWORD'"
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'sudo lsof -i :80'"
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'docker ps -a --filter \"expose=80\" '"
+
+
+                        
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'docker stop httpd-container'"
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'docker rm httpd-container'"
+                        
+                        
+                        // Run Docker commands on the remote server
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'sudo systemctl stop nginx'"
+
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'docker pull $DOCKER_HUB_REPO:$BUILD_NUMBER'"
+                        sh "ssh $REMOTE_SERVER_USERNAME@$REMOTE_SERVER_ADDRESS 'docker run -d -p 80:80 --name httpd-container $DOCKER_HUB_REPO:$BUILD_NUMBER'"
+                    }
+                }
+            }
+        }
+    }
+
+  /*  post {
+        always {
+            // Clean up: Remove the Docker image and container after the build is complete
+            script {
+                sh "docker rmi $DOCKER_HUB_REPO:$BUILD_NUMBER"
+                sh "docker rmi $DOCKER_HUB_REPO:latest"
+                sh "docker rm -f httpd-container"
+            }
+        }
+    } */
+}
